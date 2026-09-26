@@ -1,0 +1,22 @@
+{
+  "name": "reachinbox-email-scheduler-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "server",
+    "worker",
+    "client"
+  ],
+  "scripts": {
+    "build:shared": "npm --workspace=shared run build",
+    "build:server": "npm --workspace=server run build",
+    "build:worker": "npm --workspace=worker run build",
+    "build:client": "npm --workspace=client run build",
+    "build": "npm run build:shared && npm run build:server && npm run build:worker && npm run build:client",
+    "migrate": "npm --workspace=server run migrate",
+    "dev:server": "npm --workspace=server run dev",
+    "dev:worker": "npm --workspace=worker run dev",
+    "dev:client": "npm --workspace=client run dev"
+  }
+}

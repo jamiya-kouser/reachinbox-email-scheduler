@@ -1,0 +1,26 @@
+import mysql from 'mysql2/promise';
+import { env } from '../config/env';
+
+export const pool = mysql.createPool({
+  host: env.MYSQL_HOST,
+  port: env.MYSQL_PORT,
+  user: env.MYSQL_USER,
+  password: env.MYSQL_PASSWORD,
+  database: env.MYSQL_DATABASE,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  timezone: '+00:00', // UTC
+});
+
+export async function checkMySQLConnection(): Promise<boolean> {
+  try {
+    const connection = await pool.getConnection();
+    await connection.ping();
+    connection.release();
+    return true;
+  } catch (error) {
+    console.error('MySQL connection ping failed:', error);
+    return false;
+  }
+}
