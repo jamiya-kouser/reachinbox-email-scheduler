@@ -1,75 +1,433 @@
 # ReachInbox Email Scheduler
 
-A distributed, reliable, and fault-tolerant email scheduling system with rate limiting, anti-thundering-herd rescheduling, and search capabilities.
+A full-stack email scheduling system built for the ReachInbox SDE Intern assignment.
 
-## Architecture Overview
+The application provides a React-based dashboard for scheduling emails, an Express API for managing scheduling requests, MySQL for persistent email state, Redis and BullMQ for durable delayed jobs, and a worker service that delivers emails through SMTP.
 
+## Architecture
+
+```text
+┌──────────────────────┐
+│      React + Vite    │
+│    Email Dashboard   │
+└──────────┬───────────┘
+           │ HTTP
+           ▼
+┌──────────────────────┐
+│    Express API       │
+│   Port 4000          │
+└───────┬───────┬──────┘
+        │       │
+        │       ▼
+        │   ┌──────────────┐
+        │   │    MySQL     │
+        │   │ Email State  │
+        │   └──────────────┘
+        │
+        ▼
+┌──────────────────────┐
+│        Redis         │
+│      BullMQ Queue    │
+└──────────┬───────────┘
+           │
+           │ Delayed Job
+           ▼
+┌──────────────────────┐
+│    Worker Service    │
+│    Email Processor   │
+└──────────┬───────────┘
+           │ SMTP
+           ▼
+┌──────────────────────┐
+│   Ethereal SMTP      │
+│   Email Delivery     │
+└──────────────────────┘
 ```
-React (Vite + Tailwind) -> Express API -> MySQL (State of Truth) -> Redis -> BullMQ Delayed Jobs -> Worker -> Ethereal SMTP
-                                      |
-                                      +-> Elasticsearch (Full-text Search)
-                                      +-> Slack (Rate-limit Alerts)
+
+## Tech Stack
+
+### Frontend
+
+* React
+* TypeScript
+* Vite
+* Tailwind CSS
+
+### Backend
+
+* Node.js
+* Express
+* TypeScript
+* Passport.js
+* Google OAuth 2.0
+* Express Session
+
+### Data & Infrastructure
+
+* MySQL 8
+* Redis 7
+* BullMQ
+* Elasticsearch 8
+
+### Email
+
+* Nodemailer
+* Ethereal SMTP
+
+### Development
+
+* Docker
+* npm workspaces
+* TypeScript
+
+## Core Features
+
+### Email Scheduling
+
+Users can schedule an email for a future date and time.
+
+The scheduling flow is:
+
+```text
+Dashboard
+   ↓
+POST /api/v1/emails/schedule
+   ↓
+Validate request
+   ↓
+Create email record in MySQL
+   ↓
+Create delayed BullMQ job
+   ↓
+Redis stores the job
+   ↓
+Worker processes job when due
+   ↓
+SMTP delivery through Ethereal
+   ↓
+MySQL status → SENT
 ```
 
-- **Database**: MySQL 8.0 with `mysql2/promise`
-- **Cache & Queue Broker**: Redis 7 with Append-Only File (AOF) persistence
-- **Queue Engine**: BullMQ with native delayed jobs (no cron, node-cron, or polling loops)
-- **Email Delivery**: Ethereal Email SMTP (Nodemailer) with instant web preview URLs
-- **Authentication**: Google OAuth 2.0 with Redis-backed server-side sessions and HttpOnly cookies
-- **Search**: Elasticsearch 8.x for user-scoped email indexing and querying
-- **Notifications**: Slack OAuth 2.0 with rate-limit alerts
+### Durable Delayed Jobs
 
----
+BullMQ is used for delayed email delivery.
 
-## Rate-Limit Rescheduling Algorithm & Mathematical Specification
+Jobs are persisted through Redis rather than relying on in-memory timers. This allows the worker to process scheduled jobs independently from the API process.
 
-When high-volume batches (e.g., 1,000+ emails) are scheduled, they must satisfy two concurrent constraints:
-1. **Sender Hourly Quota**: At most $Q$ emails (e.g., 200 emails) per discrete calendar hour $[H, H+1)$.
-2. **Minimum Inter-Email Delay**: At least $D$ milliseconds (e.g., 2,000 ms) between consecutive dispatches from the same sender account.
+Each email uses its database ID as the BullMQ `jobId`.
 
-### Why Simple Offsets are Incorrect
-- Spacing 200 emails by 2,000 ms consumes $200 \times 2,000\text{ ms} = 400\text{ seconds}$ (~6.67 minutes).
-- Assuming $Q$ emails consume an entire hour, or scheduling all overflow emails to the exact start of the next hour ($HH:00:00.000$), causes a severe thundering herd stampede and violates the minimum delay.
+### Idempotency
 
-### The Correct Algorithm
-To guarantee deterministic FIFO ordering, prevent stampedes, and respect both constraints across distributed workers:
-1. **Window Boundaries**:
-   - Discrete hourly windows are keyed by UTC hour: $W_0, W_1, W_2, \dots$ where $W_k = [T_{\text{start}}(k), T_{\text{end}}(k))$.
-2. **Per-Window Quota Tracking**:
-   - An atomic Redis counter tracks emails allocated to window $W_k$:
-     $$\text{allocated}(W_k) \le Q$$
-3. **Discrete Slot Reservation**:
-   - The timestamp for the $n$-th email within window $W_k$ is computed as:
-     $$T_{\text{slot}}(k, n) = T_{\text{start}}(k) + (n \times D)$$
-   - Because $Q \times D \le 3,600\text{ seconds}$ (e.g., $200 \times 2\text{s} = 400\text{s} < 3,600\text{s}$), the first $Q$ emails fit safely inside window $W_k$.
-4. **Window Overflow & Cascading**:
-   - When $\text{allocated}(W_k)$ reaches quota $Q$, subsequent emails overflow into window $W_{k+1}$ starting at $T_{\text{start}}(k+1) = T_{\text{start}}(k) + 3,600\text{s}$.
-   - The overflow emails take discrete slots:
-     $$T_{\text{slot}}(k+1, m) = T_{\text{start}}(k+1) + (m \times D) \quad \text{for } 0 \le m < Q$$
-5. **No Job Loss Guarantee**:
-   - Emails exceeding current quota are never rejected or failed. They are rescheduled via BullMQ `moveToDelayed(T_slot)` and marked `RESCHEDULED` in MySQL.
+The scheduling endpoint requires an `Idempotency-Key`.
 
----
+Repeated requests with the same key for the same user return the existing email instead of creating another email record.
 
-## Idempotency & Duplicate-Send Mitigation
+This prevents accidental duplicate scheduling when a client retries a request.
 
-- **Application-Level Idempotency**:
-  - `POST /api/v1/emails/schedule` accepts an `Idempotency-Key` header.
-  - Replayed requests return the existing record and HTTP 200.
-  - The `emails.idempotency_key` column is indexed with a `UNIQUE` constraint.
-- **Queue Deduplication**: BullMQ jobs use deterministic IDs (`jobId = email.id`).
-- **State Transition Guard**: Optimistic update `WHERE status IN ('PENDING', 'RESCHEDULED')` prevents duplicate executions.
-- **External SMTP Boundary**: SMTP delivery lacks two-phase commit (2PC). If a network failure occurs after SMTP transmission but before MySQL status update, the system guarantees at-least-once delivery with deduplication on retry.
+### Email Processing State
 
----
+Emails maintain persistent delivery state in MySQL.
 
-## Phase Status
+Supported states include:
 
-- [x] **Phase 1: Foundation & Persistence Infrastructure** (MySQL, Redis, Elasticsearch, Express, React, TypeScript).
-- [ ] **Phase 2: Authentication & Sessions** (Google OAuth 2.0, CSRF defense, Redis sessions).
-- [ ] **Phase 3: Queues, Worker & Email Dispatch** (BullMQ, Nodemailer Ethereal SMTP, startup reconciliation).
-- [ ] **Phase 4: Concurrency & Rate Limiting** (Atomic Lua rate limiter, slot reservation, rescheduling).
-- [ ] **Phase 5: Email Scheduling & Ingestion API** (Single & batch CSV ingestion, Idempotency-Key).
-- [ ] **Phase 6: Integrations** (Elasticsearch indexing & search, Slack OAuth & alerts).
-- [ ] **Phase 7: Frontend Application** (React dashboard, tables, search bar, modals).
-- [ ] **Phase 8: Verification & Hardening** (E2E simulation, load test, evaluator demo).
+```text
+PENDING
+QUEUED
+PROCESSING
+SENT
+RESCHEDULED
+FAILED
+CANCELLED
+```
+
+The worker uses an atomic database update to claim an email before processing it.
+
+### Retry Handling
+
+BullMQ jobs are configured with retry attempts and exponential backoff.
+
+If delivery fails, the worker records the error and allows BullMQ to retry the job.
+
+After the configured attempts are exhausted, the email is marked as `FAILED`.
+
+### Authentication
+
+Google OAuth 2.0 authentication is implemented using Passport.js with server-side sessions backed by Redis.
+
+User sessions use HttpOnly cookies.
+
+The scheduling API validates the authenticated user before accessing user-owned resources.
+
+> **Development note:** Because the Google OAuth client configuration could not be browser-verified in the assignment environment, the local demo dashboard includes a development-only demo mode for demonstrating the scheduling pipeline. This mode is enabled only when `NODE_ENV=development` and the request explicitly contains the demo header. It is not intended for production.
+
+## Database
+
+The application uses MySQL 8 for persistent application state.
+
+Main entities include:
+
+* `users`
+* `senders`
+* `email_batches`
+* `emails`
+* `slack_connections`
+
+The `emails` table stores:
+
+* recipient information
+* subject and body
+* scheduling time
+* delivery status
+* attempt count
+* BullMQ job ID
+* idempotency key
+* delivery/error information
+
+## Infrastructure
+
+The project can run its infrastructure services using Docker.
+
+Required services:
+
+```text
+MySQL        → localhost:3306
+Redis        → localhost:6379
+Elasticsearch → localhost:9200
+```
+
+Example:
+
+```bash
+docker compose up -d
+```
+
+Check running containers:
+
+```bash
+docker ps
+```
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/jamiya-kouser/reachinbox-email-scheduler.git
+cd reachinbox-email-scheduler
+```
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Create the environment file:
+
+```bash
+copy .env.example .env
+```
+
+Configure the required environment variables in `.env`.
+
+**Never commit `.env` to GitHub.**
+
+## Database Migration
+
+Run:
+
+```bash
+npm run migrate
+```
+
+## Development
+
+Start the backend:
+
+```bash
+npm run dev:server
+```
+
+Start the worker:
+
+```bash
+npm run dev:worker
+```
+
+Start the frontend:
+
+```bash
+npm run dev:client
+```
+
+The development application runs with:
+
+```text
+Frontend: http://localhost:3001
+Backend:  http://localhost:4000
+```
+
+## Production Build
+
+Build all workspaces:
+
+```bash
+npm run build
+```
+
+The build includes:
+
+```text
+Shared package
+Server
+Worker
+Client
+```
+
+The project has been verified with a successful complete TypeScript/Vite production build.
+
+## Health Check
+
+The backend exposes:
+
+```text
+GET /health
+```
+
+The endpoint checks connectivity with the application's infrastructure dependencies.
+
+## Email Delivery Verification
+
+The complete scheduling pipeline was tested locally:
+
+```text
+React Dashboard
+      ↓
+Express API
+      ↓
+MySQL
+      ↓
+BullMQ
+      ↓
+Redis
+      ↓
+Worker
+      ↓
+Nodemailer
+      ↓
+Ethereal SMTP
+      ↓
+MySQL status = SENT
+```
+
+A scheduled email was successfully processed by the worker and persisted with `SENT` status in MySQL.
+
+## Project Structure
+
+```text
+reachinbox-email-scheduler/
+│
+├── client/
+│   └── src/
+│       ├── App.tsx
+│       └── index.css
+│
+├── server/
+│   └── src/
+│       ├── auth.ts
+│       ├── routes.ts
+│       ├── server.ts
+│       ├── config/
+│       ├── db/
+│       ├── queues/
+│       └── redis/
+│
+├── worker/
+│   └── src/
+│       ├── index.ts
+│       ├── processors/
+│       ├── services/
+│       ├── db/
+│       ├── redis/
+│       └── config/
+│
+├── shared/
+│   └── src/
+│
+├── docker-compose.yml
+├── package.json
+├── package-lock.json
+└── .env.example
+```
+
+## Engineering Decisions
+
+### Why BullMQ?
+
+BullMQ provides durable delayed jobs backed by Redis and allows the API and worker to operate independently.
+
+### Why MySQL?
+
+MySQL acts as the source of truth for email state. Queue state is not used as the application's only record of an email.
+
+### Why use the email ID as the BullMQ job ID?
+
+Using the persistent email ID provides a stable relationship between the database record and the queue job and supports idempotent scheduling.
+
+### Why server-side sessions?
+
+Authentication state remains on the server and the browser receives an HttpOnly session cookie rather than application secrets.
+
+## Current Implementation Status
+
+### Implemented and locally verified
+
+* React scheduling dashboard
+* Express scheduling API
+* MySQL persistence
+* Redis connectivity
+* BullMQ delayed jobs
+* Worker email processing
+* SMTP delivery through Ethereal
+* Email status updates
+* Idempotency-key handling
+* Retry configuration
+* Complete project build
+* Docker-based infrastructure
+* Google OAuth implementation
+* Redis-backed sessions
+
+### Implemented but not browser-verified
+
+* Google OAuth browser login, due to the Google Cloud OAuth client configuration returning an `invalid_client` response in the assignment environment.
+
+### Not presented as completed
+
+The following assignment capabilities are not represented as fully completed features in this submission:
+
+* Production-ready hourly rate-limit scheduling/rescheduling
+* Elasticsearch search UI/API
+* Slack OAuth and alert integration
+* Full sender-management UI
+* Bulk campaign import
+* Persistent dashboard activity/history UI
+
+The repository therefore documents the implemented and verified functionality rather than claiming unverified features.
+
+## Security Notes
+
+* Secrets are stored in `.env`.
+* `.env` is excluded from version control.
+* Only `.env.example` is committed.
+* Session cookies are HttpOnly.
+* User ownership is checked when accessing scheduling resources.
+* Development demo mode is explicitly restricted to development environments.
+
+## Author
+
+**Jamiya Kouser**
+
+CSE – Artificial Intelligence & Machine Learning
+
+GitHub:
+https://github.com/jamiya-kouser
