@@ -26,6 +26,9 @@ const envSchema = z.object({
   ENCRYPTION_KEY: z.string().min(32).default('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'),
 
   CLIENT_URL: z.string().url().default('http://localhost:3000'),
+GOOGLE_CLIENT_ID: z.string().min(1),
+GOOGLE_CLIENT_SECRET: z.string().min(1),
+GOOGLE_CALLBACK_URL: z.string().url(),
 });
 
 const parsed = envSchema.safeParse(process.env);
